@@ -14,6 +14,7 @@
 #    under the License.
 
 import abc
+import base64
 import contextlib
 import functools
 import os
@@ -35,6 +36,7 @@ from nova import keymgr
 from nova.openstack.common import fileutils
 from nova import utils
 from nova.virt.disk import api as disk
+from nova.virt.image import model as imgmodel
 from nova.virt import images
 from nova.virt.libvirt import config as vconfig
 from nova.virt.libvirt import dmcrypt
@@ -370,6 +372,26 @@ class Image(object):
         reason = _('clone() is not implemented')
         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
                                           reason=reason)
+
+    def direct_snapshot(self, context, snapshot_name, image_format, image_id,
+                        base_image_id):
+        """Prepare a snapshot for direct reference from glance
+
+        :raises: exception.ImageUnacceptable if it cannot be
+                 referenced directly in the specified image format
+        :returns: URL to be given to glance
+        """
+        reason = _('direct_snapshot() is not implemented')
+        raise exception.ImageUnacceptable(image_id=image_id, reason=reason)
+
+    def cleanup_direct_snapshot(self, location, destroy=False,
+                                ignore_errors=False):
+        """Performs any cleanup actions required after calling
+        direct_snapshot(), for graceful exception handling and the like.
+
+        This should be a no-op on any backend where it is not implemented.
+        """
+        pass
 
     def _get_lock_name(self, base):
         """Get an image's name of a base file."""
@@ -766,6 +788,107 @@ class Rbd(Image):
         reason = _('No image locations are accessible')
         raise exception.ImageUnacceptable(image_id=image_id_or_uri,
                                           reason=reason)
+
+    def get_model(self, connection):
+        secret = None
+        if CONF.libvirt.rbd_secret_uuid:
+            secretobj = connection.secretLookupByUUIDString(
+                CONF.libvirt.rbd_secret_uuid)
+            secret = base64.b64encode(secretobj.value())
+
+        hosts, ports = self.driver.get_mon_addrs()
+        servers = [str(':'.join(k)) for k in zip(hosts, ports)]
+
+        return imgmodel.RBDImage(self.rbd_name,
+                                 self.pool,
+                                 self.rbd_user,
+                                 secret,
+                                 servers)
+
+    def import_file(self, instance, local_file, remote_name):
+        name = '%s_%s' % (instance.uuid, remote_name)
+        if self.check_image_exists():
+            self.driver.remove_image(name)
+        self.driver.import_image(local_file, name)
+
+    def _get_parent_pool(self, context, base_image_id, fsid):
+        parent_pool = None
+        try:
+            # The easy way -- the image is an RBD clone, so use the parent
+            # images' storage pool
+            parent_pool, _im, _snap = self.driver.parent_info(self.rbd_name)
+        except exception.ImageUnacceptable:
+            # The hard way -- the image is itself a parent, so ask Glance
+            # where it came from
+            LOG.debug('No parent info; asking Glance where its store is')
+            try:
+                image_meta = IMAGE_API.get(context, base_image_id,
+                                           include_locations=True)
+            except Exception:
+                image_meta = {}
+
+            # Find the first location that is in the same RBD cluster
+            for location in image_meta.get('locations', []):
+                try:
+                    parent_fsid, parent_pool, _im, _snap = \
+                        self.driver.parse_url(location['url'])
+                    if parent_fsid == fsid:
+                        break
+                    else:
+                        parent_pool = None
+                except exception.ImageUnacceptable:
+                    continue
+
+        if not parent_pool:
+            reason = _LE('cannot determine where to store images')
+            raise exception.ImageUnacceptable(reason)
+
+        return parent_pool
+
+    def direct_snapshot(self, context, snapshot_name, image_format,
+                        image_id, base_image_id):
+        """Creates an RBD snapshot directly.
+        """
+        fsid = self.driver.get_fsid()
+        # NOTE(nic): Nova has zero comprehension of how Glance's image store
+        # is configured, but we can infer what storage pool Glance is using
+        # by looking at the parent image.  If using authx, write access should
+        # be enabled on that pool for the Nova user
+        parent_pool = self._get_parent_pool(context, base_image_id, fsid)
+
+        # Snapshot the disk and clone it into Glance's storage pool.  librbd
+        # requires that snapshots be set to "protected" in order to clone them
+        self.driver.create_snap(self.rbd_name, snapshot_name, protect=True)
+        location = {'url': 'rbd://%(fsid)s/%(pool)s/%(image)s/%(snap)s' %
+                           dict(fsid=fsid,
+                                pool=self.pool,
+                                image=self.rbd_name,
+                                snap=snapshot_name)}
+        try:
+            self.driver.clone(location, image_id, dest_pool=parent_pool)
+            # Flatten the image, which detaches it from the source snapshot
+            self.driver.flatten(image_id, pool=parent_pool)
+        finally:
+            # all done with the source snapshot, clean it up
+            self.cleanup_direct_snapshot(location)
+
+        # Glance makes a protected snapshot called 'snap' on uploaded
+        # images and hands it out, so we'll do that too
+        self.driver.create_snap(image_id, 'snap', pool=parent_pool,
+                                protect=True)
+        return ('rbd://%(fsid)s/%(pool)s/%(image)s/snap' %
+                dict(fsid=fsid, pool=parent_pool, image=image_id))
+
+    def cleanup_direct_snapshot(self, location, destroy=False,
+                                ignore_errors=False):
+        """Unprotects and destroys the name snapshot.
+        """
+        if location:
+            _fsid, _pool, _im, _snap = self.driver.parse_url(location['url'])
+            self.driver.remove_snap(_im, _snap, pool=_pool, force=True,
+                                    ignore_errors=ignore_errors)
+            if destroy:
+                self.driver.destroy_volume(_im, pool=_pool)
 
 
 class Ploop(Image):

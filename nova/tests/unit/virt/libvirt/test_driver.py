@@ -13550,6 +13550,37 @@ class LibvirtSnapshotTests(_BaseSnapshotTests):
         self._test_snapshot(disk_format='qcow2',
                             extra_properties=extra_properties)
 
+    @mock.patch.object(rbd_utils, 'RBDDriver')
+    @mock.patch.object(rbd_utils, 'rbd')
+    def test_raw_with_rbd_clone(self, mock_rbd, mock_driver):
+        self.flags(images_type='rbd', group='libvirt')
+        rbd = mock_driver.return_value
+        rbd.parent_info = mock.Mock(return_value=['test-pool', '', ''])
+        rbd.parse_url = mock.Mock(return_value=['a', 'b', 'c', 'd'])
+        with mock.patch.object(fake_libvirt_utils, 'find_disk',
+                               return_value='rbd://some/fake/rbd/image'):
+            with mock.patch.object(fake_libvirt_utils, 'disk_type', new='rbd'):
+                self._test_snapshot(disk_format='raw')
+        rbd.clone.assert_called_with(mock.ANY, mock.ANY, dest_pool='test-pool')
+        rbd.flatten.assert_called_with(mock.ANY, pool='test-pool')
+
+    @mock.patch.object(rbd_utils, 'RBDDriver')
+    @mock.patch.object(rbd_utils, 'rbd')
+    def test_raw_with_rbd_clone_graceful_fallback(self, mock_rbd, mock_driver):
+        self.flags(images_type='rbd', group='libvirt')
+        rbd = mock_driver.return_value
+        rbd.parent_info = mock.Mock(side_effect=exception.ImageUnacceptable(
+            image_id='fake_id', reason='rbd testing'))
+        with contextlib.nested(
+                mock.patch.object(libvirt_driver.imagebackend.images,
+                                  'convert_image',
+                                  side_effect=_fake_convert_image),
+                mock.patch.object(fake_libvirt_utils, 'find_disk',
+                                  return_value='rbd://some/fake/rbd/image'),
+                mock.patch.object(fake_libvirt_utils, 'disk_type', new='rbd')):
+            self._test_snapshot(disk_format='raw')
+            self.assertFalse(rbd.clone.called)
+
 
 class LXCSnapshotTests(LibvirtSnapshotTests):
     """Repeat all of the Libvirt snapshot tests, but with LXC enabled"""
