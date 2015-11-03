@@ -1362,7 +1362,7 @@ class LibvirtDriver(driver.ComputeDriver):
         if (self._host.has_min_version(MIN_LIBVIRT_LIVESNAPSHOT_VERSION,
                                        MIN_QEMU_LIVESNAPSHOT_VERSION,
                                        REQ_HYPERVISOR_LIVESNAPSHOT)
-             and source_format not in ('lvm', 'rbd')
+             and source_format not in ('lvm')
              and not CONF.ephemeral_storage_encryption.enabled
              and not CONF.workarounds.disable_libvirt_livesnapshot):
             live_snapshot = True
@@ -1426,6 +1426,9 @@ class LibvirtDriver(driver.ComputeDriver):
             update_task_state(task_state=task_states.IMAGE_PENDING_UPLOAD,
                               expected_state=task_states.IMAGE_UPLOADING)
 
+            # Standard snapshot uses qemu img-convert which is not safe to run
+            # with live_snapshot.
+            live_snapshot = False
             snapshot_directory = CONF.libvirt.snapshots_directory
             fileutils.ensure_tree(snapshot_directory)
             with utils.tempdir(dir=snapshot_directory) as tmpdir:
